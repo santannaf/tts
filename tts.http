@@ -1,0 +1,4 @@
+### GET request to example server
+POST http://localhost:8080/tts/connect?text=Ola mundo, Tudo bem ?
+
+###
