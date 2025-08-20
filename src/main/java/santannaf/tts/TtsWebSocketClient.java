@@ -15,8 +15,6 @@ import reactor.core.publisher.FluxSink;
 import reactor.core.publisher.Mono;
 
 import java.net.URI;
-import java.net.URLEncoder;
-import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.Base64;
 import java.util.Objects;
@@ -114,8 +112,8 @@ public class TtsWebSocketClient {
 
         var uri = UriComponentsBuilder
                 .fromUriString("wss://api.elevenlabs.io/v1/text-to-speech/{voiceId}/stream-input")
-                .queryParamIfPresent("model_id", (modelId==null||modelId.isBlank()) ? java.util.Optional.empty() : java.util.Optional.of(modelId.trim()))
-                .queryParamIfPresent("output_format", (outputFormat==null||outputFormat.isBlank()) ? java.util.Optional.empty() : java.util.Optional.of(outputFormat.trim()))
+                .queryParamIfPresent("model_id", (modelId == null || modelId.isBlank()) ? java.util.Optional.empty() : java.util.Optional.of(modelId.trim()))
+                .queryParamIfPresent("output_format", (outputFormat == null || outputFormat.isBlank()) ? java.util.Optional.empty() : java.util.Optional.of(outputFormat.trim()))
                 .buildAndExpand(v)
                 .toUri();
 
@@ -126,7 +124,7 @@ public class TtsWebSocketClient {
         log.info("voiceId : {}", v);
         log.info("modelId : {}", modelId);
         log.info("outFmt  : {}", outputFormat);
-        log.info("apiKey  : ...{}", k.length() >= 6 ? k.substring(k.length()-6) : "(short)");
+        log.info("apiKey  : ...{}", k.length() >= 6 ? k.substring(k.length() - 6) : "(short)");
 
         return Flux.create((FluxSink<byte[]> sink) -> {
             final long start = System.currentTimeMillis();
@@ -216,10 +214,6 @@ public class TtsWebSocketClient {
                             }
                     );
         }, FluxSink.OverflowStrategy.BUFFER);
-    }
-
-    private static String url(String s) {
-        return URLEncoder.encode(s, StandardCharsets.UTF_8);
     }
 
     private static String headHex(byte[] b) {

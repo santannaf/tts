@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+    <meta charset="utf-8"/>
+    <title>Conversação em tempo real (proxy WS↔WS)</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1"/>
+    <style>
+        :root { --bg:#0b1020; --fg:#e8ecf1; --muted:#9aa6b2; --card:#141b34; --accent:#5b8def; --danger:#ff6b6b; }
+        *{box-sizing:border-box}
+        body{margin:0;font-family:system-ui,Inter,Arial,sans-serif;background:var(--bg);color:var(--fg)}
+        .wrap{max-width:900px;margin:28px auto;padding:0 16px}
+        .card{background:var(--card);border-radius:16px;padding:20px;box-shadow:0 10px 24px rgba(0,0,0,.25)}
+        h2{margin:0 0 6px;font-size:22px}
+        input,textarea,button{font-size:16px}
+        input,textarea{width:100%;border-radius:12px;border:1px solid #27325b;background:#0f152a;color:var(--fg);padding:10px 12px}
+        textarea{min-height:84px}
+        .row{display:grid;gap:12px;grid-template-columns:2fr}
+        .actions{display:flex;gap:10px;margin-top:12px;align-items:center}
+        button{border:0;border-radius:12px;padding:10px 14px;cursor:pointer;font-weight:700}
+        .primary{background:var(--accent);color:#fff}
+        .secondary{background:#1b274b;color:#d8e2f0}
+        .danger{background:var(--danger);color:#fff}
+        .pill{display:inline-block;padding:2px 8px;border-radius:999px;background:#0f152a;border:1px solid #27325b;margin-left:8px}
+        .log{background:#0f152a;border:1px solid #27325b;border-radius:12px;padding:10px;height:220px;overflow:auto;
+            font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px}
+        .hint{color:var(--muted);font-size:13px}
+    </style>
+</head>
+<body>
+<div class="wrap">
+    <div class="card">
+        <h2>Conversação em tempo real (proxy WS↔WS)</h2>
+
+        <div class="row">
+            <div>
+                <label>Agent ID</label>
+                <input id="agentId" placeholder="Cole aqui o agent_id"/>
+            </div>
+        </div>
+
+        <label style="display:block;margin-top:8px;">Mensagem inicial (enviada como <code>user_message</code>)</label>
+        <textarea id="firstMsg" placeholder="Ex.: Olá! Você me escuta?">Olá! Você me escuta?</textarea>
+        <div class="hint">Obs.: Nenhum override é enviado. Só <code>user_message</code> + áudio PCM 16 kHz.</div>
+
+        <div class="actions" style="margin-top:8px;">
+            <button class="primary" id="connectBtn">Conectar & Falar</button>
+            <button class="secondary" id="stopBtn" disabled>Parar</button>
+            <button class="danger" id="clearBtn">Limpar logs</button>
+            <span class="pill" id="status">desconectado</span>
+        </div>
+
+        <h3 style="margin-top:16px;">Logs</h3>
+        <div class="log" id="logs"></div>
+    </div>
+</div>
+
+<script>
+    const WS_BASE = "ws://localhost:8080/convai/ws";
+
+    // UI refs
+    const $agent = document.getElementById('agentId');
+    const $first = document.getElementById('firstMsg');
+    const $connect = document.getElementById('connectBtn');
+    const $stop = document.getElementById('stopBtn');
+    const $clear = document.getElementById('clearBtn');
+    const $status = document.getElementById('status');
+    const $logs = document.getElementById('logs');
+
+    // State
+    let ws, mediaStream, audioCtx, micSource, processor;
+    let playCtx, playScheduledTime = 0;
+    let agentSampleRate = 16000; // confirmado via metadata; default 16 kHz
+
+    // Utils
+    const log = (...a) => {
+        const d=document.createElement('div');
+        d.textContent = a.map(x => typeof x==='object'? JSON.stringify(x): String(x)).join(' ');
+        $logs.appendChild(d); $logs.scrollTop=$logs.scrollHeight;
+        console.log(...a);
+    };
+    const setStatus = s => $status.textContent = s;
+
+    function floatTo16kPCM(float32Array, inputRate) {
+        // Reamostra linear para 16 kHz e converte para Int16 LE
+        const ratio = inputRate / 16000;
+        const outLen = Math.floor(float32Array.length / ratio);
+        const out = new Int16Array(outLen);
+        for (let o=0; o<outLen; o++) {
+            const idx = o*ratio, i0 = Math.floor(idx), i1 = Math.min(i0+1, float32Array.length-1);
+            const frac = idx - i0;
+            const sample = float32Array[i0]*(1-frac) + float32Array[i1]*frac;
+            const s = Math.max(-1, Math.min(1, sample));
+            out[o] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+        }
+        return out;
+    }
+    const b64FromInt16 = (i16)=> {
+        let bin=''; const bytes=new Uint8Array(i16.buffer);
+        for (let i=0;i<bytes.length;i++) bin += String.fromCharCode(bytes[i]);
+        return btoa(bin);
+    };
+    const int16FromB64 = (b64)=> {
+        const bin = atob(b64); const bytes = new Uint8Array(bin.length);
+        for (let i=0;i<bin.length;i++) bytes[i] = bin.charCodeAt(i);
+        return new Int16Array(bytes.buffer);
+    };
+    const int16ToFloat32 = (i16)=> {
+        const f32 = new Float32Array(i16.length);
+        for (let i=0;i<i16.length;i++) f32[i] = Math.max(-1, i16[i]/0x8000);
+        return f32;
+    };
+
+    function startPlayback(sampleRate=16000){
+        // cria AudioContext no gesto do usuário (clique) para evitar bloqueio de autoplay
+        if (!playCtx) {
+            playCtx = new (window.AudioContext||window.webkitAudioContext)({sampleRate:48000});
+            playScheduledTime = playCtx.currentTime + 0.05; // 50ms de headroom
+            log('Playback pronto. Agent sampleRate=', sampleRate);
+        }
+    }
+    function playPcm16(i16, sampleRate=16000){
+        if (!playCtx) startPlayback(sampleRate);
+        const float32 = int16ToFloat32(i16);
+        const buf = playCtx.createBuffer(1, float32.length, sampleRate); // reamostra se necessário
+        buf.copyToChannel(float32, 0);
+        const src = playCtx.createBufferSource();
+        src.buffer = buf; src.connect(playCtx.destination);
+        const when = Math.max(playScheduledTime, playCtx.currentTime);
+        src.start(when); playScheduledTime = when + buf.duration;
+    }
+
+    async function start(){
+        const agentId = $agent.value.trim();
+        if (!agentId) { alert('Informe o agent_id'); return; }
+
+        setStatus('conectando…'); $connect.disabled=true; $stop.disabled=false;
+
+        // 1) Abre WS para o proxy
+        ws = new WebSocket(`${WS_BASE}?agentId=${encodeURIComponent(agentId)}`);
+
+        ws.onopen = async () => {
+            setStatus('conectado');
+
+            // 2) Envia user_message imediato (evita timeout por silêncio)
+            const hello = ($first.value.trim() || "Olá! Você me escuta?");
+            ws.send(JSON.stringify({ type: "user_message", text: hello }));
+            log('user_message enviado:', hello);
+
+            // 3) Inicia captura do microfone
+            mediaStream = await navigator.mediaDevices.getUserMedia({ audio:true });
+            audioCtx = new (window.AudioContext||window.webkitAudioContext)();
+            const FRAME = 320; // 20 ms @ 16 kHz
+            let acc16 = new Int16Array(0);
+            let sentFrames = 0, firstLogged = false;
+
+            function appendInt16(a,b){ const out=new Int16Array(a.length+b.length); out.set(a,0); out.set(b,a.length); return out; }
+
+            micSource = audioCtx.createMediaStreamSource(mediaStream);
+            processor = audioCtx.createScriptProcessor(4096,1,1);
+            processor.onaudioprocess = (e) => {
+                const f32 = e.inputBuffer.getChannelData(0);
+                const pcm16 = floatTo16kPCM(f32, audioCtx.sampleRate);
+                acc16 = appendInt16(acc16, pcm16);
+
+                while (acc16.length >= FRAME) {
+                    const frame = acc16.slice(0, FRAME);
+                    acc16 = acc16.slice(FRAME);
+                    if (ws && ws.readyState === WebSocket.OPEN) {
+                        ws.send(JSON.stringify({ user_audio_chunk: b64FromInt16(frame) }));
+                        sentFrames++;
+                        if (!firstLogged) {
+                            log(`primeiro frame enviado: ${frame.length} amostras (~20ms)`);
+                            firstLogged = true;
+                        }
+                    }
+                }
+            };
+            micSource.connect(processor); processor.connect(audioCtx.destination);
+
+            // estatística simples de frames por segundo
+            const fpsTimer = setInterval(() => {
+                if (!ws || ws.readyState !== WebSocket.OPEN) { clearInterval(fpsTimer); return; }
+                log(`frames enviados (últimos ~1s): ~${sentFrames}`); sentFrames = 0;
+            }, 1000);
+        };
+
+        ws.onmessage = (ev) => {
+            const msg = JSON.parse(ev.data);
+
+            if (msg.type === "conversation_initiation_metadata") {
+                const meta = msg.conversation_initiation_metadata_event;
+                log('metadata', meta);
+                if (meta.agent_output_audio_format && meta.agent_output_audio_format.includes("16000")) {
+                    agentSampleRate = 16000;
+                }
+                startPlayback(agentSampleRate);
+            }
+            if (msg.type === "user_transcript") {
+                log("👤", msg.user_transcription_event.user_transcript);
+            }
+            if (msg.type === "agent_response") {
+                log("🤖", msg.agent_response_event.agent_response);
+            }
+            if (msg.type === "audio") {
+                playPcm16(int16FromB64(msg.audio_event.audio_base_64), agentSampleRate);
+            }
+            if (msg.type === "ping") {
+                try { ws.send(JSON.stringify({ type: "pong", event_id: msg.ping_event.event_id })); } catch {}
+            }
+            if (msg.error) {
+                log("❗ erro:", msg.error);
+            }
+        };
+
+        ws.onclose = (e) => {
+            log(`WS closed clean=${e.wasClean} code=${e.code} reason=${e.reason||''}`);
+            setStatus('desconectado'); $connect.disabled=false; $stop.disabled=true; cleanup();
+        };
+        ws.onerror = (e) => { log('WS error', e); };
+    }
+
+    function cleanup(){
+        try { if (processor) processor.disconnect(); } catch {}
+        try { if (micSource) micSource.disconnect(); } catch {}
+        try { if (audioCtx) audioCtx.close(); } catch {}
+        if (playCtx) { try { playCtx.close(); } catch {} ; playCtx=null; }
+        processor = micSource = audioCtx = null;
+        playScheduledTime = 0;
+    }
+
+    function stopAll(){
+        if (ws && ws.readyState === WebSocket.OPEN) ws.close();
+        ws = null; cleanup(); setStatus('desconectado'); $connect.disabled=false; $stop.disabled=true;
+    }
+
+    // Eventos UI
+    $connect.onclick = () => start().catch(err => { log(err); setStatus('erro'); $connect.disabled=false; $stop.disabled=true; });
+    $stop.onclick = stopAll;
+    $clear.onclick = () => { $logs.textContent = ''; };
+</script>
+</body>
+</html>

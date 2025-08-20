@@ -5,7 +5,12 @@ import org.springframework.core.io.buffer.DataBuffer;
 import org.springframework.core.io.buffer.DefaultDataBufferFactory;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.annotation.*;
+import org.springframework.web.bind.annotation.CrossOrigin;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
@@ -28,7 +33,8 @@ public class TtsController {
     @Value("${eleven.labs.modelId:}")
     private String defaultModelId;
 
-    @Value("${eleven.outputFormat:mp3_44100_128}") private String defaultOutputFormat;
+    @Value("${eleven.outputFormat:mp3_44100_128}")
+    private String defaultOutputFormat;
 
     @PostMapping("/connect")
     public Mono<ResponseEntity<String>> connect(
@@ -43,7 +49,6 @@ public class TtsController {
     public ResponseEntity<Flux<DataBuffer>> stream(
             @RequestParam("text") String text
     ) {
-        // logging amigo
         String preview = text.length() > 64 ? text.substring(0, 64) + "…" : text;
 
         System.out.printf("HTTP /tts/stream textLen=%d preview=\"%s\" voiceId=%s modelId=%s outputFormat=%s%n",
