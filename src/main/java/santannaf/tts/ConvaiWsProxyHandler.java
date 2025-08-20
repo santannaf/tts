@@ -7,6 +7,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 import org.springframework.web.reactive.function.client.WebClient;
+import org.springframework.web.reactive.socket.CloseStatus;
 import org.springframework.web.reactive.socket.WebSocketHandler;
 import org.springframework.web.reactive.socket.WebSocketMessage;
 import org.springframework.web.reactive.socket.WebSocketSession;
@@ -22,7 +23,7 @@ import java.util.Optional;
 
 @Component
 public class ConvaiWsProxyHandler implements WebSocketHandler {
-    private static final Logger log = LoggerFactory.getLogger(ConvaiWsProxyHandler.class);
+    private static final Logger LOGGER = LoggerFactory.getLogger(ConvaiWsProxyHandler.class);
 
     private final WebClient http;
     private final ReactorNettyWebSocketClient wsClient;
@@ -50,20 +51,20 @@ public class ConvaiWsProxyHandler implements WebSocketHandler {
         Map<String, String> params = QueryParams.of(qp);
         String agentId = params.get("agentId");
         if (agentId == null || agentId.isBlank()) {
-            log.warn("agentId ausente na query string");
+            LOGGER.warn("agentId ausente na query string");
             return clientSession.send(Mono.just(clientSession.textMessage("{\"error\":\"agentId is required\"}"))).then();
         }
 
         return getSignedUrl(agentId)
                 .flatMap(signedUrl -> bridge(clientSession, signedUrl))
                 .onErrorResume(e -> {
-                    log.error("Falha ao obter signed_url ou ao iniciar bridge", e);
+                    LOGGER.error("Falha ao obter signed_url ou ao iniciar bridge", e);
                     return clientSession.send(Mono.just(clientSession.textMessage("{\"error\":\"proxy_init_failed\"}"))).then();
                 });
     }
 
     private Mono<String> getSignedUrl(String agentId) {
-        log.info("Solicitando signed_url para agentId={}", agentId);
+        LOGGER.info("Solicitando signed_url para agentId={}", agentId);
         return http.get()
                 .uri(uri -> uri.path("/v1/convai/conversation/get-signed-url")
                         .queryParam("agent_id", agentId).build())
@@ -78,7 +79,7 @@ public class ConvaiWsProxyHandler implements WebSocketHandler {
                             sink.error(new IllegalStateException("signed_url vazio"));
                             return;
                         }
-                        log.info("signed_url OK (prefix)={}", signed.substring(0, Math.min(60, signed.length())));
+                        LOGGER.info("signed_url OK (prefix)={}", signed.substring(0, Math.min(60, signed.length())));
                         sink.next(signed);
                     } catch (Exception ex) {
                         sink.error(new RuntimeException("Erro parseando signed_url: " + ex.getMessage(), ex));
@@ -87,7 +88,7 @@ public class ConvaiWsProxyHandler implements WebSocketHandler {
     }
 
     private Mono<Void> bridge(WebSocketSession clientSession, String elevenSignedUrl) {
-        log.info("Iniciando bridge WS ↔ WS. ClientId={}, Eleven={}", id(clientSession), elevenSignedUrl);
+        LOGGER.info("Iniciando bridge WS ↔ WS. ClientId={}, Eleven={}", id(clientSession), elevenSignedUrl);
 
         return wsClient.execute(URI.create(elevenSignedUrl), elevenSession -> {
             // FLUX: cliente → eleven (repasse de tudo que o cliente enviar)
@@ -95,7 +96,7 @@ public class ConvaiWsProxyHandler implements WebSocketHandler {
                     clientSession.receive()
                             .map(msg -> {
                                 String txt = msg.getPayloadAsText();
-                                log.debug("[C→E] {}", slice(txt));
+                                LOGGER.debug("[C→E] {}", slice(txt));
                                 return elevenSession.textMessage(txt);
                             });
 
@@ -103,9 +104,9 @@ public class ConvaiWsProxyHandler implements WebSocketHandler {
             Flux<String> elevenInboundText =
                     elevenSession.receive()
                             .map(WebSocketMessage::getPayloadAsText)
-                            .doOnSubscribe(s -> log.info("eleven.receive subscribed"))
-                            .doOnComplete(() -> log.info("eleven.receive completed (server fechou)"))
-                            .doOnError(err -> log.error("eleven.receive error", err))
+                            .doOnSubscribe(_ -> LOGGER.info("eleven.receive subscribed"))
+                            .doOnComplete(() -> LOGGER.info("eleven.receive completed (server fechou)"))
+                            .doOnError(err -> LOGGER.error("eleven.receive error", err))
                             .publish()
                             .autoConnect(2);
 
@@ -122,11 +123,12 @@ public class ConvaiWsProxyHandler implements WebSocketHandler {
                                             pong.put("type", "pong");
                                             pong.put("event_id", eventId);
                                             String out = pong.toString();
-                                            log.debug("[AUTO-PONG] {}", out);
+                                            LOGGER.debug("[AUTO-PONG] {}", out);
                                             return Mono.just(elevenSession.textMessage(out));
                                         }
                                     }
-                                } catch (Exception ignore) {}
+                                } catch (Exception ignore) {
+                                }
                                 return Mono.empty();
                             });
 
@@ -134,48 +136,65 @@ public class ConvaiWsProxyHandler implements WebSocketHandler {
             Mono<Void> upstream =
                     elevenSession
                             .send(Flux.merge(clientToElevenMsg, autoPongs))
-                            .doOnSubscribe(s -> log.info("Upstream iniciado (cliente→eleven)"))
-                            .doOnError(err -> log.error("Erro upstream", err));
+                            .doOnSubscribe(_ -> LOGGER.info("Upstream iniciado (cliente→eleven)"))
+                            .doOnError(err -> LOGGER.error("Erro upstream", err));
 
             // Downstream (para cliente): tudo que vier da Eleven vai para o cliente
             Mono<Void> downstream =
                     clientSession
                             .send(elevenInboundText.map(clientSession::textMessage))
-                            .doOnSubscribe(s -> log.info("Downstream iniciado (eleven→cliente)"))
-                            .doOnError(err -> log.error("Erro downstream", err));
+                            .doOnSubscribe(_ -> LOGGER.info("Downstream iniciado (eleven→cliente)"))
+                            .doOnError(err -> LOGGER.error("Erro downstream", err));
 
             // Fecha ambos quando qualquer ponta termina
-            return Mono.when(upstream, downstream)
+
+            return Mono.whenDelayError(upstream, downstream)
                     .timeout(Duration.ofMinutes(15))
-                    .doFinally(sig -> {
-                        try { clientSession.close(); } catch (Throwable ignored) {}
-                        try { elevenSession.close(); } catch (Throwable ignored) {}
-                        log.info("Bridge encerrada. Motivo={}", sig);
-                    });
+                    .onErrorResume(_ -> Mono.empty())
+                    .doFinally(sig -> LOGGER.info("Bridge encerrada. Motivo={}", sig))
+                    .then(
+                            Mono.whenDelayError(
+                                    clientSession.close(CloseStatus.NORMAL).onErrorResume(_ -> Mono.empty()),
+                                    elevenSession.close(CloseStatus.NORMAL).onErrorResume(_ -> Mono.empty())
+                            )
+                    );
+
+//            return Mono.when(upstream, downstream)
+//                    .timeout(Duration.ofMinutes(15))
+//                    .doFinally(sig -> {
+//                        try { clientSession.close(); } catch (Throwable ignored) {}
+//                        try { elevenSession.close(); } catch (Throwable ignored) {}
+//                        LOGGER.info("Bridge encerrada. Motivo={}", sig);
+//                    });
         });
     }
 
     private static String id(WebSocketSession s) {
         return s.getId() + "@" + s.getHandshakeInfo().getRemoteAddress();
     }
+
     private static String slice(String s) {
         if (s == null) return "null";
         return s.length() > 300 ? s.substring(0, 300) + " …" : s;
     }
 
     static class QueryParams {
-        static Map<String,String> of(String raw) {
-            java.util.HashMap<String,String> m = new java.util.HashMap<>();
+        static Map<String, String> of(String raw) {
+            java.util.HashMap<String, String> m = new java.util.HashMap<>();
             if (raw == null || raw.isBlank()) return m;
             for (String p : raw.split("&")) {
                 int i = p.indexOf('=');
-                if (i > 0) m.put(urlDecode(p.substring(0,i)), urlDecode(p.substring(i+1)));
+                if (i > 0) m.put(urlDecode(p.substring(0, i)), urlDecode(p.substring(i + 1)));
             }
             return m;
         }
+
         static String urlDecode(String s) {
-            try { return java.net.URLDecoder.decode(s, java.nio.charset.StandardCharsets.UTF_8); }
-            catch (Exception e) { return s; }
+            try {
+                return java.net.URLDecoder.decode(s, java.nio.charset.StandardCharsets.UTF_8);
+            } catch (Exception e) {
+                return s;
+            }
         }
     }
 }

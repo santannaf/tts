@@ -1,4 +1,4 @@
-package santannaf.tts;
+package santannaf.tts.config;
 
 import io.netty.handler.logging.LogLevel;
 import org.springframework.context.annotation.Bean;

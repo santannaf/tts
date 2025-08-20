@@ -1,10 +1,11 @@
-package santannaf.tts;
+package santannaf.tts.config;
 
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.web.reactive.handler.SimpleUrlHandlerMapping;
 import org.springframework.web.reactive.socket.WebSocketHandler;
 import org.springframework.web.reactive.socket.server.support.WebSocketHandlerAdapter;
+import santannaf.tts.ConvaiWsProxyHandler;
 
 import java.util.Map;
 
@@ -12,7 +13,6 @@ import java.util.Map;
 public class ConvaiWsConfig {
     @Bean
     public SimpleUrlHandlerMapping wsMapping(ConvaiWsProxyHandler proxy) {
-        // ordem alta (menor número) para priorizar WS
         var mapping = new SimpleUrlHandlerMapping();
         mapping.setOrder(1);
         mapping.setUrlMap(Map.of(
