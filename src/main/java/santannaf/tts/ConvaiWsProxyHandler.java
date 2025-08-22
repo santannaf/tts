@@ -12,10 +12,13 @@ import org.springframework.web.reactive.socket.WebSocketHandler;
 import org.springframework.web.reactive.socket.WebSocketMessage;
 import org.springframework.web.reactive.socket.WebSocketSession;
 import org.springframework.web.reactive.socket.client.ReactorNettyWebSocketClient;
+import reactor.core.publisher.BufferOverflowStrategy;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Schedulers;
 
 import java.net.URI;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
@@ -56,6 +59,7 @@ public class ConvaiWsProxyHandler implements WebSocketHandler {
         }
 
         return getSignedUrl(agentId)
+                .publishOn(Schedulers.boundedElastic())
                 .flatMap(signedUrl -> bridge(clientSession, signedUrl))
                 .onErrorResume(e -> {
                     LOGGER.error("Falha ao obter signed_url ou ao iniciar bridge", e);
@@ -93,9 +97,12 @@ public class ConvaiWsProxyHandler implements WebSocketHandler {
         return wsClient.execute(URI.create(elevenSignedUrl), elevenSession -> {
             // FLUX: cliente → eleven (repasse de tudo que o cliente enviar)
             Flux<WebSocketMessage> clientToElevenMsg =
-                    clientSession.receive()
-                            .map(msg -> {
-                                String txt = msg.getPayloadAsText();
+                    clientSession
+                            .receive()
+                            .onBackpressureBuffer(2048, BufferOverflowStrategy.DROP_OLDEST)
+                            .map(msg -> msg.getPayloadAsText(StandardCharsets.UTF_8))
+                            .publishOn(Schedulers.boundedElastic())
+                            .map(txt -> {
                                 LOGGER.debug("[C→E] {}", slice(txt));
                                 return elevenSession.textMessage(txt);
                             });
@@ -107,6 +114,7 @@ public class ConvaiWsProxyHandler implements WebSocketHandler {
                             .doOnSubscribe(_ -> LOGGER.info("eleven.receive subscribed"))
                             .doOnComplete(() -> LOGGER.info("eleven.receive completed (server fechou)"))
                             .doOnError(err -> LOGGER.error("eleven.receive error", err))
+                            .publishOn(Schedulers.boundedElastic())
                             .publish()
                             .autoConnect(2);
 
@@ -130,7 +138,7 @@ public class ConvaiWsProxyHandler implements WebSocketHandler {
                                 } catch (Exception ignore) {
                                 }
                                 return Mono.empty();
-                            });
+                            }).subscribeOn(Schedulers.boundedElastic());
 
             // Upstream (para Eleven): tudo que o cliente mandar + eventuais pongs automáticos
             Mono<Void> upstream =
@@ -158,14 +166,6 @@ public class ConvaiWsProxyHandler implements WebSocketHandler {
                                     elevenSession.close(CloseStatus.NORMAL).onErrorResume(_ -> Mono.empty())
                             )
                     );
-
-//            return Mono.when(upstream, downstream)
-//                    .timeout(Duration.ofMinutes(15))
-//                    .doFinally(sig -> {
-//                        try { clientSession.close(); } catch (Throwable ignored) {}
-//                        try { elevenSession.close(); } catch (Throwable ignored) {}
-//                        LOGGER.info("Bridge encerrada. Motivo={}", sig);
-//                    });
         });
     }
 
